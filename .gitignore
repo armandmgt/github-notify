@@ -69,3 +69,7 @@ fastlane/test_output
 
 Carthage/
 .secrets
+# Ignore editor files
+*~
+# Ignore build folder
+/Builds

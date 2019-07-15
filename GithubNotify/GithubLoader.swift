@@ -1,46 +1,54 @@
 import Foundation
-import OAuth2
+import Alamofire
 import SwiftyJSON
 
-class GithubLoader: OAuth2DataLoader {
+extension Request {
+    public func debugLog() -> Self {
+        #if DEBUG
+        debugPrint(self)
+        #endif
+        return self
+    }
+}
+
+class GithubLoader {
     let baseURL = URL(string: "https://api.github.com/")!
+    var username: String
+    var accessToken: String
+    
+    let manager: SessionManager = {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        return SessionManager(configuration: configuration)
+    }()
 
-    public init(clientId: String, clientSecret: String) {
-        let oauth = OAuth2CodeGrant(settings: [
-            "client_id": clientId,
-            "client_secret": clientSecret,
-            "authorize_uri": "https://github.com/login/oauth/authorize",
-            "token_uri": "https://github.com/login/oauth/access_token",
-            "scope": "notifications",
-            "redirect_uris": ["github-notify://oauth"],
-            "secret_in_body": true,
-            "verbose": true,
-        ])
-
-        super.init(oauth2: oauth)
+    public init(username: String, accessToken: String) {
+        self.username = username
+        self.accessToken = accessToken
     }
 
     public func refreshNotifications(callback: @escaping (([JSON]?, Error?) -> Void)) {
-        oauth2.logger = OAuth2DebugLogger(.trace)
-
         let url = baseURL.appendingPathComponent("notifications")
 
-        var request = oauth2.request(forURL: url)
-        request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
-
-        perform(request: request) { response in
-            do {
-                let responseString = String(data: try response.responseData(), encoding: .utf8)!
-                let notifications = JSON.init(parseJSON: responseString).array!
-
-                DispatchQueue.main.async {
-                    callback(notifications, nil)
-                }
-            } catch let error {
-                DispatchQueue.main.async {
-                    callback(nil, error)
+        var headers: HTTPHeaders = [
+            "Accept": "application/vnd.github.v3+json, application/json"
+        ]
+        if let authorizationHeader = Request.authorizationHeader(user: username, password: accessToken) {
+            headers[authorizationHeader.key] = authorizationHeader.value
+        }
+        manager.request(url, headers: headers)
+            .validate()
+            .responseString { response in
+                if response.error == nil {
+                    let notifications = JSON.init(parseJSON: response.result.value!).array!
+                    DispatchQueue.main.async {
+                        callback(notifications, nil)
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        callback(nil, response.error)
+                    }
                 }
             }
-        }
     }
 }

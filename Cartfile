@@ -1,2 +1,2 @@
-github "SwiftyJSON/SwiftyJSON"
-github "p2/OAuth2" ~> 3.0
+github "SwiftyJSON/SwiftyJSON" ~> 4.0
+github "Alamofire/Alamofire" ~> 4.7

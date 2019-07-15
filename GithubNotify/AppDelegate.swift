@@ -1,86 +1,87 @@
 import Cocoa
-import OAuth2
 
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate {
 
-    var github: GithubLoader!
+    struct Credentials {
+        var username: String
+        var accessToken: String
+    }
+    
+    enum KeychainError: Error {
+        case noPassword
+        case unexpectedPasswordData
+        case unhandledError(status: OSStatus)
+    }
+
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    var defaultItemAction: Selector?
+    var settingsWindowController: SettingsWindowController?
+
+    var github: GithubLoader?
+    static let server = "github-notify"
+    var credentials = Credentials(username: "", accessToken: "")
+    
     var unreadCount = 0
-    let statusItem = NSStatusBar.system().statusItem(withLength: NSSquareStatusItemLength)
 
     func applicationDidFinishLaunching(_: Notification) {
-        // Register our URL scheme.
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(AppDelegate.handleGetURL(event:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL))
-
         unreadCount = 0
 
-        // Pull Github OAuth credentials
-        guard let infoPlist = Bundle.main.infoDictionary,
-            let clientId = infoPlist["GITHUB_OAUTH_CLIENT_ID"] as? String,
-            let clientSecret = infoPlist["GITHUB_OAUTH_CLIENT_SECRET"] as? String else {
-            print("Missing GitHub credentials in Info.plist!")
-            return
+        initStatusItem()
+        updateMenubarIcon()
+        
+        do {
+            try loadCredentials()
+        } catch KeychainError.noPassword {
+            openSettings(nil)
+        } catch {
+            NSAlert(error: error).runModal()
         }
 
-        github = GithubLoader(clientId: clientId, clientSecret: clientSecret)
-        github.attemptToAuthorize(callback: { _, error in
-            if error != nil {
-                NSAlert(error: error!).runModal()
-                NSApp.terminate(self)
-            } else {
-                self.refreshNotifications(nil)
-            }
-        })
-
-        updateMenubarIcon()
-        buildIconMenu()
-
         // Refresh the unread notification count.
-        Timer.scheduledTimer(timeInterval: 60.0,
+        Timer.scheduledTimer(timeInterval: 90.0,
                              target: self,
                              selector: #selector(AppDelegate.refreshNotifications),
                              userInfo: nil,
                              repeats: true)
+        refreshNotifications(nil)
     }
 
-    @objc
-    func openNotificationUrl(_: Any?) {
-        NSWorkspace.shared().open(URL(string: "https://github.com/notifications")!)
+    @IBAction func openNotificationUrl(_ sender: Any) {
+        NSWorkspace.shared.open(URL(string: "https://github.com/notifications")!)
     }
-
-    func buildIconMenu() {
-        let menu = NSMenu()
-
-        menu.addItem(NSMenuItem(title: "Refresh notifications", action: #selector(AppDelegate.refreshNotifications(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open in browser", action: #selector(AppDelegate.openNotificationUrl(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit GithubNotify", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
-        statusItem.menu = menu
-    }
-
-    func updateMenubarIcon() {
-        let icon: String
-        if unreadCount > 0 {
-            icon = "MenuIconUnread"
-        } else {
-            icon = "MenuIconDefault"
+    
+    @IBOutlet var statusItemMenu: NSMenu!
+    
+    @IBAction func openSettings(_ sender: NSMenuItem?) {
+        let storyboard = NSStoryboard(name: "Main", bundle: nil)
+        if let windowController = storyboard.instantiateController(withIdentifier: "SettingsWindowController") as? SettingsWindowController {
+            settingsWindowController = windowController
+            settingsWindowController!.showWindow(self)
         }
-
+    }
+    
+    func updateMenubarIcon() {
         if let button = statusItem.button {
             button.toolTip = "\(unreadCount) unread notifications."
+
+            var icon = "MenuIconDefault"
+            if unreadCount > 0 {
+                icon = "MenuIconUnread"
+                defaultItemAction = button.action
+                button.target = self
+                button.action = #selector(openNotificationUrl(_:))
+                let options: NSEvent.EventTypeMask = [.leftMouseUp, .rightMouseUp]
+                button.sendAction(on: options)
+            } else if defaultItemAction != nil {
+                button.action = defaultItemAction
+            }
             button.image = NSImage(named: icon)
-            button.action = #selector(openNotificationUrl(_:))
         }
     }
 
-    @objc
-    func refreshNotifications(_: Any?) {
-        github.refreshNotifications { notifications, error in
+    @IBAction func refreshNotifications(_ sender: Any?) {
+        github?.refreshNotifications { notifications, error in
             if let error = error as? URLError {
                 // Would be too noisy if we alerted every time we closed the lid.
                 print("Not connected to internet: \(error)")
@@ -94,18 +95,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.updateMenubarIcon()
         }
     }
-
-    func handleGetURL(event: NSAppleEventDescriptor!, withReplyEvent _: NSAppleEventDescriptor!) {
-        if let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
-            let url = URL(string: urlString) {
-
-            if url.scheme == "github-notify" {
-                do {
-                    try github.oauth2.handleRedirectURL(url)
-                } catch let error {
-                    NSAlert(error: error).runModal()
-                }
-            }
+    
+    func loadCredentials() throws {
+        let query: [String: Any] = [kSecClass as String: kSecClassInternetPassword,
+                                    kSecAttrServer as String: AppDelegate.server,
+                                    kSecMatchLimit as String: kSecMatchLimitOne,
+                                    kSecReturnAttributes as String: true,
+                                    kSecReturnData as String: true]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status != errSecItemNotFound else { throw KeychainError.noPassword }
+        guard status == errSecSuccess else { throw KeychainError.unhandledError(status: status) }
+        guard let existingItem = item as? [String : Any],
+            let passwordData = existingItem[kSecValueData as String] as? Data,
+            let accessToken = String(data: passwordData, encoding: String.Encoding.utf8),
+            let account = existingItem[kSecAttrAccount as String] as? String
+            else {
+                throw KeychainError.unexpectedPasswordData
         }
+        credentials = Credentials(username: account, accessToken: accessToken)
+
+        github = GithubLoader(username: credentials.username, accessToken: credentials.accessToken)
+    }
+    
+    func storeCredentials() throws {
+        let query: [String: Any] = [kSecClass as String: kSecClassInternetPassword,
+                                    kSecAttrAccount as String: credentials.username,
+                                    kSecAttrServer as String: AppDelegate.server,
+                                    kSecValueData as String: credentials.accessToken]
+        SecItemDelete(query as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError.unhandledError(status: status) }
+
+        try loadCredentials()
+    }
+    
+    private func initStatusItem() {
+        statusItem.title = "GithubNotify"
+        statusItem.menu = self.statusItemMenu
     }
 }
